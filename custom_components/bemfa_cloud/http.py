@@ -87,7 +87,23 @@ class BemfaCloudHttp:
             "topics": [topic.as_api_item() for topic in topics],
             "region": self._region,
         }
-        await self._post(ADD_TOPICS_URL, payload)
+        async with self._session.post(ADD_TOPICS_URL, json=payload, timeout=30) as response:
+            try:
+                data = await response.json(content_type=None)
+            except ValueError:
+                data = {"raw": await response.text()}
+
+        if response.status >= 400:
+            raise BemfaCloudApiError(f"HTTP {response.status}: {data}")
+
+        if data.get("code") not in (0, None):
+            raise BemfaCloudApiError(str(data.get("msg") or data))
+
+        result = data.get("data") if isinstance(data.get("data"), dict) else {}
+        if exists := result.get("exists"):
+            LOGGER.debug("Bemfa topics already exist: %s", exists)
+        if failed := result.get("failed"):
+            LOGGER.warning("Bemfa failed to create topics: %s", failed)
 
     async def async_modify_name(self, topic: str, name: str) -> None:
         """Update a Bemfa topic display name."""
