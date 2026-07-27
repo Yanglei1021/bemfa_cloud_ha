@@ -85,8 +85,5 @@ CHANGE_TOPIC_ROOM_URL: Final = "http://apis.bemfa.com/vb/api/v1/changeTopicRoom"
 MODIFY_TOPIC_NAME_URL: Final = "https://apis.bemfa.com/va/modifyName"
 
 TOPIC_PREFIX: Final = "ha"
-MSG_SEPARATOR: Final = "#"
-MSG_ON: Final = "on"
-MSG_OFF: Final = "off"
 MSG_PAUSE: Final = "pause"
 MSG_SPEED_COUNT: Final = 4

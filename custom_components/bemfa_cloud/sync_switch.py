@@ -1,7 +1,7 @@
 """Support for bemfa service."""
 from __future__ import annotations
 
-from collections.abc import Mapping, Callable
+from collections.abc import Mapping
 from typing import Any
 from homeassistant.components.automation import DOMAIN as AUTOMATION_DOMAIN
 from homeassistant.components.camera import DOMAIN as CAMERA_DOMAIN
@@ -52,9 +52,8 @@ from homeassistant.const import (
     STATE_PLAYING,
 )
 from homeassistant.core import DOMAIN as HOMEASSISTANT_DOMAIN
-from homeassistant.util.read_only_dict import ReadOnlyDict
-from .const import MSG_OFF, MSG_ON, TopicSuffix
-from .sync import SYNC_TYPES, ControllableSync
+from .const import TopicSuffix
+from .sync import SYNC_TYPES, ControllableSync, UNPUBLISHABLE_STATES
 
 
 @SYNC_TYPES.register("switch")
@@ -93,42 +92,21 @@ class Switch(ControllableSync):
             syncs.append(cls(hass, state.entity_id, state.name))
         return syncs
 
-    def _msg_generators(
-        self,
-    ) -> list[Callable[[str, ReadOnlyDict[Mapping[str, Any]]], str | int]]:
-        return [self._msg_generator()]
+    def _generate_msg_payload(self) -> dict[str, Any]:
+        state = self._hass.states.get(self._entity_id)
+        if state is None or state.state in UNPUBLISHABLE_STATES:
+            return {}
+        return {"on": self._is_on(state.state, state.attributes)}
 
-    def _msg_resolvers(
-        self,
-    ) -> list[
-        (
-            int,
-            int,
-            Callable[
-                [list[str | int], ReadOnlyDict[Mapping[str, Any]]],
-                (str, str, dict[str, Any]),
-            ],
-        )
-    ]:
-        return [
-            (
-                # split bemfa msg by "#", then take a sub list
-                0,  # from this index
-                1,  # to this index
-                lambda msg, attributes: (  # and pass to this fun as param "msg"
-                    self._service_domain(),
-                    self._service_names()[0]
-                    if msg[0] == MSG_ON
-                    else self._service_names()[1],
-                    {},
-                ),
-            )
-        ]
+    def _is_on(self, state: str, attributes: Mapping[str, Any]) -> bool:
+        return state == STATE_ON
 
-    def _msg_generator(
-        self,
-    ) -> Callable[[str, ReadOnlyDict[Mapping[str, Any]]], str | int]:
-        return lambda state, attributes: MSG_ON if state == STATE_ON else MSG_OFF
+    def _resolve_on_off(
+        self, on: bool, attributes: Mapping[str, Any]
+    ) -> tuple[str, str, dict[str, Any]]:
+        domain = self._service_domain()
+        service = self._service_names()[0] if on else self._service_names()[1]
+        return (domain, service, {})
 
     def _service_domain(self) -> str:
         """Domain of service calls."""
@@ -147,10 +125,8 @@ class Camera(Switch):
     def _supported_domain() -> str:
         return CAMERA_DOMAIN
 
-    def _msg_generator(
-        self,
-    ) -> Callable[[str, ReadOnlyDict[Mapping[str, Any]]], str | int]:
-        return lambda state, attributes: MSG_OFF if state == _CAMERA_STATE_IDLE else MSG_ON
+    def _is_on(self, state: str, attributes: Mapping[str, Any]) -> bool:
+        return state != _CAMERA_STATE_IDLE
 
 
 @SYNC_TYPES.register("outlet")
@@ -190,10 +166,8 @@ class TV(Switch):
     def _supported_domain() -> str:
         return MEDIA_PLAYER_DOMAIN
 
-    def _msg_generator(
-        self,
-    ) -> Callable[[str, ReadOnlyDict[Mapping[str, Any]]], str | int]:
-        return lambda state, attributes: MSG_ON if state == STATE_PLAYING else MSG_OFF
+    def _is_on(self, state: str, attributes: Mapping[str, Any]) -> bool:
+        return state == STATE_PLAYING
 
     def resolve_msg(self, msg: Any):
         command = msg.get("action") if isinstance(msg, dict) else str(msg)
@@ -223,10 +197,8 @@ class Lock(Switch):
     def _supported_domain() -> str:
         return LOCK_DOMAIN
 
-    def _msg_generator(
-        self,
-    ) -> Callable[[str, ReadOnlyDict[Mapping[str, Any]]], str | int]:
-        return lambda state, attributes: MSG_OFF if state == 'locked' else MSG_ON
+    def _is_on(self, state: str, attributes: Mapping[str, Any]) -> bool:
+        return state != 'locked'
 
     def _service_names(self) -> tuple[str, str]:
         return (SERVICE_UNLOCK, SERVICE_LOCK)
@@ -240,10 +212,8 @@ class Scene(Switch):
     def _supported_domain() -> str:
         return SCENE_DOMAIN
 
-    def _msg_generator(
-        self,
-    ) -> Callable[[str, ReadOnlyDict[Mapping[str, Any]]], str | int]:
-        return lambda state, attributes: MSG_OFF
+    def _is_on(self, state: str, attributes: Mapping[str, Any]) -> bool:
+        return False
 
 
 @SYNC_TYPES.register("group")
@@ -266,47 +236,20 @@ class Vacuum(Switch):
     def _supported_domain() -> str:
         return VACUUM_DOMAIN
 
-    def _msg_generator(
-        self,
-    ) -> Callable[[str, ReadOnlyDict[Mapping[str, Any]]], str | int]:
-        return (
-            lambda state, attributes: MSG_ON
-            if state in [STATE_ON, _VACUUM_CLEANING]
-            else MSG_OFF
-        )
+    def _is_on(self, state: str, attributes: Mapping[str, Any]) -> bool:
+        return state in [STATE_ON, _VACUUM_CLEANING]
 
-    def _msg_resolvers(
-        self,
-    ) -> list[
-        (
-            int,
-            int,
-            Callable[
-                [list[str | int], ReadOnlyDict[Mapping[str, Any]]],
-                (str, str, dict[str, Any]),
-            ],
-        )
-    ]:
-        return [
-            (
-                0,
-                1,
-                lambda msg, attributes: (
-                    VACUUM_DOMAIN,
-                    SERVICE_START
-                    if msg[0] == MSG_ON
-                    and attributes[ATTR_SUPPORTED_FEATURES] & VacuumEntityFeature.START
-                    else SERVICE_TURN_ON
-                    if msg[0] == MSG_ON
-                    else SERVICE_RETURN_TO_BASE
-                    if msg[0] == MSG_OFF
-                    and attributes[ATTR_SUPPORTED_FEATURES]
-                    & VacuumEntityFeature.RETURN_HOME
-                    else SERVICE_STOP
-                    if msg[0] == MSG_OFF
-                    and attributes[ATTR_SUPPORTED_FEATURES] & VacuumEntityFeature.STOP
-                    else SERVICE_TURN_OFF,
-                    {},
-                ),
-            )
-        ]
+    def _resolve_on_off(
+        self, on: bool, attributes: Mapping[str, Any]
+    ) -> tuple[str, str, dict[str, Any]]:
+        features = attributes.get(ATTR_SUPPORTED_FEATURES, 0)
+        if on:
+            if features & VacuumEntityFeature.START:
+                return (VACUUM_DOMAIN, SERVICE_START, {})
+            return (VACUUM_DOMAIN, SERVICE_TURN_ON, {})
+        else:
+            if features & VacuumEntityFeature.RETURN_HOME:
+                return (VACUUM_DOMAIN, SERVICE_RETURN_TO_BASE, {})
+            if features & VacuumEntityFeature.STOP:
+                return (VACUUM_DOMAIN, SERVICE_STOP, {})
+            return (VACUUM_DOMAIN, SERVICE_TURN_OFF, {})

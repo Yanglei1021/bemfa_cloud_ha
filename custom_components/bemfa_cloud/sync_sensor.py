@@ -21,13 +21,6 @@ SENSOR_PAYLOAD_BY_DEVICE_CLASS = {
     SensorDeviceClass.PM25: "pm25",
     SensorDeviceClass.CO2: "co2",
 }
-SENSOR_MSG_INDEX_BY_PAYLOAD = {
-    "t": 1,
-    "h": 2,
-    "illuminance": 4,
-    "pm25": 5,
-    "co2": 6,
-}
 
 
 @SYNC_TYPES.register("sensor")
@@ -53,19 +46,6 @@ class Sensor(Sync):
 
     def get_watched_entity_ids(self) -> list[str]:
         return [self._entity_id]
-
-    def _generate_msg_parts(self) -> list[str]:
-        state = self._hass.states.get(self._entity_id)
-        if state is None or state.state in UNPUBLISHABLE_STATES:
-            return []
-
-        payload_name = self._payload_name(state.attributes)
-        if payload_name is None:
-            return []
-
-        msg = [""] * SENSOR_MSG_INDEX_BY_PAYLOAD[payload_name]
-        msg.append(state.state)
-        return msg
 
     def _generate_msg_payload(self) -> dict[str, Any]:
         state = self._hass.states.get(self._entity_id)
