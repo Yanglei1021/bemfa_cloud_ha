@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import json
 from abc import ABC, abstractmethod
-from collections.abc import Mapping, Callable
+from collections.abc import Mapping
 import hashlib
 from typing import Any
 import voluptuous as vol
@@ -15,9 +15,6 @@ from homeassistant.util.decorator import Registry
 from homeassistant.util.read_only_dict import ReadOnlyDict
 
 from .const import (
-    MSG_OFF,
-    MSG_ON,
-    MSG_SEPARATOR,
     OPTIONS_FAN_SPEED_0_VALUE,
     OPTIONS_FAN_SPEED_1_VALUE,
     OPTIONS_FAN_SPEED_2_VALUE,
@@ -45,7 +42,7 @@ CLIMATE_SWING_CONFIG_KEYS = [
     OPTIONS_SWING_VERTICAL_VALUE,
     OPTIONS_SWING_BOTH_VALUE,
 ]
-CLIMATE_SWING_VALUES = ["0#0", "1#0", "0#1", "1#1"]
+CLIMATE_SWING_VALUES = [(0, 0), (1, 0), (0, 1), (1, 1)]
 
 
 class Sync(ABC):
@@ -190,78 +187,9 @@ class Sync(ABC):
             return None
         return payload if isinstance(payload, dict) else None
 
+    @abstractmethod
     def _generate_msg_payload(self) -> dict[str, Any]:
         """Generate a Bemfa MI JSON message payload."""
-
-        parts = self._generate_msg_parts()
-
-        # remove useless tail parts
-        while len(parts) > 0 and parts[len(parts) - 1] == "":
-            parts.pop()
-
-        return self._parts_to_payload(parts)
-
-    def _parts_to_payload(self, parts: list[Any]) -> dict[str, Any]:
-        if not parts:
-            return {}
-
-        suffix = self._get_topic_suffix()
-        on = parts[0] == MSG_ON
-        if suffix in (
-            TopicSuffix.OUTLET,
-            TopicSuffix.SWITCH,
-            TopicSuffix.LIGHT,
-            TopicSuffix.FAN,
-            TopicSuffix.TV,
-            TopicSuffix.AIR_PURIFIER,
-        ):
-            payload: dict[str, Any] = {"on": on}
-            if suffix == TopicSuffix.FAN and len(parts) > 1 and parts[1] != "":
-                payload["v"] = _to_int(parts[1])
-            if suffix == TopicSuffix.AIR_PURIFIER and len(parts) > 1 and parts[1] != "":
-                payload["mode"] = parts[1]
-            return payload
-
-        if suffix == TopicSuffix.COVER:
-            payload = {"on": on}
-            if len(parts) > 1 and parts[1] != "":
-                payload["v"] = _to_int(parts[1])
-            return payload
-
-        if suffix in (
-            TopicSuffix.CLIMATE,
-            TopicSuffix.THERMOSTAT,
-            TopicSuffix.WATER_HEATER,
-        ):
-            payload = {"on": on}
-            if len(parts) > 1 and parts[1] != "":
-                if suffix == TopicSuffix.WATER_HEATER:
-                    payload["t"] = _to_int(parts[1])
-                else:
-                    payload["mode"] = _to_int(parts[1])
-            if len(parts) > 2 and parts[2] != "":
-                if suffix == TopicSuffix.WATER_HEATER:
-                    payload["mode"] = parts[2]
-                else:
-                    payload["t"] = _to_int(parts[2])
-            if suffix != TopicSuffix.WATER_HEATER and len(parts) > 3 and parts[3] != "":
-                payload["fan"] = _to_int(parts[3])
-            if suffix in (TopicSuffix.CLIMATE, TopicSuffix.THERMOSTAT):
-                if len(parts) > 4 and parts[4] != "":
-                    swing_parts = str(parts[4]).split(MSG_SEPARATOR)
-                    if len(swing_parts) > 0:
-                        payload["l2r"] = _swing_axis_payload_value(swing_parts[0])
-                    if len(swing_parts) > 1:
-                        payload["u2d"] = _swing_axis_payload_value(swing_parts[1])
-            return payload
-
-        if suffix == TopicSuffix.SENSOR:
-            return {"on": on}
-
-        return {"on": on}
-
-    @abstractmethod
-    def _generate_msg_parts(self) -> list[str]:
         raise NotImplementedError
 
 
@@ -287,66 +215,23 @@ class ControllableSync(Sync):
     def get_watched_entity_ids(self) -> list[str]:
         return [self._entity_id]
 
-    def _generate_msg_parts(self) -> list[str]:
-        state = self._hass.states.get(self._entity_id)
-        if state is None or state.state in UNPUBLISHABLE_STATES:
-            return []
-
-        generators = self._msg_generators()
-        msg = [generators[0](state.state, state.attributes)]
-
-        # if first one is off, the following parts is useless
-        if msg[0] != MSG_OFF:
-            msg += list(
-                map(
-                    lambda f: str(f(state.state, state.attributes)),
-                    generators[1:],
-                )
-            )
-        return msg
-
-    @abstractmethod
-    def _msg_generators(
-        self,
-    ) -> list[Callable[[str, ReadOnlyDict[Mapping[str, Any]]], str | int]]:
-        raise NotImplementedError
-
     def resolve_msg(self, msg: Any):
         """Resolve a message received from Bemfa service."""
         state = self._hass.states.get(self._entity_id)
         if state is None:
             return
 
-        if self._resolve_json_msg(msg, state.attributes):
-            return
+        self._resolve_json_msg(msg, state.attributes)
 
-        msg_list = self._msg_to_parts(msg, state.attributes)
-        if msg_list[0] == MSG_OFF:
-            msg_list = [MSG_OFF]  # discard any data followed by "off"
+    def _resolve_on_off(
+        self, on: bool, attributes: Mapping[str, Any]
+    ) -> tuple[str, str, dict[str, Any]]:
+        """Return (domain, service, data) for a simple on/off command."""
+        from homeassistant.const import SERVICE_TURN_OFF, SERVICE_TURN_ON
 
-        # generate msg from entity to compare to received msg
-        state_msg_list = MSG_SEPARATOR.join(self._generate_msg_parts()).split(
-            MSG_SEPARATOR
-        )
-
-        for resolver in self._msg_resolvers():
-            start_index = resolver[0]
-            end_index = min(resolver[1], len(msg_list), len(state_msg_list))
-            if msg_list[start_index:end_index] != state_msg_list[start_index:end_index]:
-                (domain, service, data) = resolver[2](
-                    [_coerce_msg_value(msg) for msg in msg_list[start_index:end_index]],
-                    state.attributes,
-                )
-                data.update({ATTR_ENTITY_ID: self._entity_id})
-                self._hass.async_create_task(
-                    self._hass.services.async_call(
-                        domain=domain,
-                        service=service,
-                        service_data=data,
-                        blocking=False,
-                    )
-                )
-                break  # call only one service at most on each msg received
+        domain = self._entity_id.split(".")[0]
+        service = SERVICE_TURN_ON if on else SERVICE_TURN_OFF
+        return (domain, service, {})
 
     def _resolve_json_msg(
         self, msg: Any, attributes: ReadOnlyDict[Mapping[str, Any]]
@@ -364,8 +249,8 @@ class ControllableSync(Sync):
 
         suffix = self._get_topic_suffix()
         if suffix in (TopicSuffix.OUTLET, TopicSuffix.SWITCH, TopicSuffix.TV):
-            parts = [MSG_ON if payload.get("on", True) else MSG_OFF]
-            (domain, service, data) = self._msg_resolvers()[0][2](parts, attributes)
+            on = payload.get("on", True)
+            domain, service, data = self._resolve_on_off(on, attributes)
             self._async_call_service(domain, service, data)
             return True
 
@@ -483,32 +368,28 @@ class ControllableSync(Sync):
                     calls.append((DOMAIN, SERVICE_SET_TEMPERATURE, {ATTR_TEMPERATURE: target_temp}))
 
             if "fan" in payload or "v" in payload:
-                fan_value = payload.get("fan", payload.get("v"))
-                fan_mode = _climate_fan_mode(
-                    _to_int(fan_value),
-                    self._config,
-                    attributes.get(ATTR_FAN_MODES, []),
-                )
-                if fan_mode is not None and attributes.get(ATTR_FAN_MODE) != fan_mode:
-                    calls.append((DOMAIN, SERVICE_SET_FAN_MODE, {"fan_mode": fan_mode}))
+                fan_value = _to_int(payload.get("fan", payload.get("v")))
+                current_fan_value = self._current_climate_fan_value(attributes)
+                if fan_value != current_fan_value:
+                    fan_mode = _climate_fan_mode(
+                        fan_value,
+                        self._config,
+                        attributes.get(ATTR_FAN_MODES, []),
+                    )
+                    if fan_mode is not None and attributes.get(ATTR_FAN_MODE) != fan_mode:
+                        calls.append((DOMAIN, SERVICE_SET_FAN_MODE, {"fan_mode": fan_mode}))
 
             if "l2r" in payload or "u2d" in payload:
                 current_l2r, current_u2d = _climate_current_swing_axes(
                     self._config, attributes.get(ATTR_SWING_MODE)
                 )
-                swing_value = MSG_SEPARATOR.join(
-                    [
-                        str(
-                            _payload_swing_axis_value(payload["l2r"])
-                            if "l2r" in payload
-                            else current_l2r
-                        ),
-                        str(
-                            _payload_swing_axis_value(payload["u2d"])
-                            if "u2d" in payload
-                            else current_u2d
-                        ),
-                    ]
+                swing_value = (
+                    _payload_swing_axis_value(payload["l2r"])
+                    if "l2r" in payload
+                    else current_l2r,
+                    _payload_swing_axis_value(payload["u2d"])
+                    if "u2d" in payload
+                    else current_u2d,
                 )
                 swing_mode = _climate_config_value(
                     self._config,
@@ -576,6 +457,12 @@ class ControllableSync(Sync):
 
         return False
 
+    def _current_climate_fan_value(self, attributes: Mapping[str, Any]) -> int | None:
+        """Return the Bemfa fan numeric value we'd currently report."""
+        payload = self._generate_msg_payload()
+        fan = payload.get("fan")
+        return _to_int(fan) if fan is not None else None
+
     def _async_call_service(
         self, domain: str, service: str, data: dict[str, Any]
     ) -> None:
@@ -604,85 +491,6 @@ class ControllableSync(Sync):
                 )
         self._hass.async_create_task(_run())
 
-    def _msg_to_parts(
-        self, msg: Any, attributes: ReadOnlyDict[Mapping[str, Any]]
-    ) -> list[str | int]:
-        """Convert Bemfa MI JSON into the legacy resolver parts."""
-
-        if isinstance(msg, dict):
-            payload = msg
-        else:
-            try:
-                payload = json.loads(msg)
-            except (TypeError, ValueError):
-                return str(msg).split(MSG_SEPARATOR)
-
-        if not isinstance(payload, dict):
-            return [str(payload)]
-
-        suffix = self._get_topic_suffix()
-        on = MSG_ON if payload.get("on", True) else MSG_OFF
-        parts: list[str | int] = [on]
-
-        if suffix == TopicSuffix.LIGHT:
-            if "bri" in payload:
-                parts.append(_to_int(payload["bri"]))
-            if "tv" in payload:
-                parts.append(1000000 // max(_to_int(payload["tv"]), 1))
-            elif all(key in payload for key in ("r", "g", "b")):
-                parts.append(
-                    _to_int(payload["r"]) * 256 * 256
-                    + _to_int(payload["g"]) * 256
-                    + _to_int(payload["b"])
-                )
-        elif suffix in (TopicSuffix.FAN, TopicSuffix.COVER):
-            if "v" in payload:
-                parts.append(_to_int(payload["v"]))
-        elif suffix in (TopicSuffix.CLIMATE, TopicSuffix.THERMOSTAT):
-            if "mode" in payload:
-                parts.append(_to_int(payload["mode"]))
-            if "t" in payload:
-                while len(parts) < 2:
-                    parts.append("")
-                parts.append(_to_int(payload["t"]))
-            if "fan" in payload or "v" in payload:
-                while len(parts) < 3:
-                    parts.append("")
-                parts.append(_to_int(payload.get("fan", payload.get("v"))))
-            if "l2r" in payload or "u2d" in payload:
-                while len(parts) < 4:
-                    parts.append("")
-                l2r = _payload_swing_axis_value(payload.get("l2r", 0))
-                u2d = _payload_swing_axis_value(payload.get("u2d", 0))
-                parts.extend([l2r, u2d])
-        elif suffix == TopicSuffix.WATER_HEATER:
-            if "t" in payload:
-                parts.append(_to_int(payload["t"]))
-            if "mode" in payload:
-                while len(parts) < 2:
-                    parts.append("")
-                parts.append(str(payload["mode"]))
-        elif suffix == TopicSuffix.AIR_PURIFIER:
-            if "mode" in payload:
-                parts.append(str(payload["mode"]))
-
-        return parts
-
-    @abstractmethod
-    def _msg_resolvers(
-        self,
-    ) -> list[
-        (
-            int,
-            int,
-            Callable[
-                [list[str | int], ReadOnlyDict[Mapping[str, Any]]],
-                (str, str, dict[str, Any]),
-            ],
-        )
-    ]:
-        raise NotImplementedError
-
 
 def _to_int(value: Any) -> int:
     """Convert JSON scalar values to int for Bemfa payload fields."""
@@ -694,10 +502,6 @@ def _to_int(value: Any) -> int:
     if isinstance(value, float):
         return round(value)
     return int(str(value))
-
-
-def _swing_axis_payload_value(value: Any) -> int:
-    return 360 if _to_int(value) != 0 else 0
 
 
 def _payload_swing_axis_value(value: Any) -> int:
@@ -726,18 +530,9 @@ def _climate_current_swing_axes(
 
     for key, value in zip(CLIMATE_SWING_CONFIG_KEYS, CLIMATE_SWING_VALUES):
         if config.get(key) == current_swing_mode:
-            l2r, u2d = value.split(MSG_SEPARATOR)
-            return (_to_int(l2r), _to_int(u2d))
+            return value
 
     return (0, 0)
-
-
-def _coerce_msg_value(value: Any) -> str | int:
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str) and value.isdigit():
-        return int(value)
-    return value
 
 
 def _climate_supported_modes() -> list[Any]:

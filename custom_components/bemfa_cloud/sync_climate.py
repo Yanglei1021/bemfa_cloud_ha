@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Final
 
 import logging
-from collections.abc import Mapping, Callable
+from collections.abc import Mapping
 import voluptuous as vol
 
 from homeassistant.components.climate import (
@@ -19,11 +19,6 @@ from homeassistant.components.climate import (
     FAN_LOW,
     FAN_MEDIUM,
     FAN_HIGH,
-    SERVICE_SET_FAN_MODE,
-    SERVICE_SET_HVAC_MODE,
-    SERVICE_SET_PRESET_MODE,
-    SERVICE_SET_TEMPERATURE,
-    SERVICE_SET_SWING_MODE,
     SWING_OFF,
     SWING_HORIZONTAL,
     SWING_VERTICAL,
@@ -32,21 +27,13 @@ from homeassistant.components.climate import (
     DOMAIN,
 )
 
-from homeassistant.const import (
-    ATTR_TEMPERATURE,
-    SERVICE_TURN_OFF,
-    SERVICE_TURN_ON,
-)
+from homeassistant.const import ATTR_TEMPERATURE
 from homeassistant.helpers.selector import (
     SelectSelector,
     SelectSelectorConfig,
     SelectSelectorMode,
 )
-from homeassistant.util.read_only_dict import ReadOnlyDict
 from .const import (
-    MSG_OFF,
-    MSG_ON,
-    MSG_SEPARATOR,
     OPTIONS_FAN_SPEED_0_VALUE,
     OPTIONS_FAN_SPEED_1_VALUE,
     OPTIONS_FAN_SPEED_2_VALUE,
@@ -65,10 +52,11 @@ from .const import (
 from .utils import has_key
 from .sync import (
     SYNC_TYPES,
+    CLIMATE_SWING_CONFIG_KEYS,
+    CLIMATE_SWING_VALUES,
     ControllableSync,
-    _climate_fan_mode,
-    _climate_hvac_mode,
-    _climate_preset_mode,
+    UNPUBLISHABLE_STATES,
+    _climate_current_swing_axes,
 )
 
 _LOGGING = logging.getLogger(__name__)
@@ -123,12 +111,7 @@ DETAILS_CFG = [
             OPTIONS_SWING_VERTICAL_VALUE,
             OPTIONS_SWING_BOTH_VALUE,
         ],
-        CFG_VALUES: [
-            MSG_SEPARATOR.join(["0", "0"]),
-            MSG_SEPARATOR.join(["1", "0"]),
-            MSG_SEPARATOR.join(["0", "1"]),
-            MSG_SEPARATOR.join(["1", "1"]),
-        ],
+        CFG_VALUES: [(0, 0), (1, 0), (0, 1), (1, 1)],
         CFG_SUGGESTED: [SWING_OFF, SWING_HORIZONTAL, SWING_VERTICAL, SWING_BOTH],
     },
 ]
@@ -136,7 +119,7 @@ DETAILS_CFG = [
 
 def _get_detail_value(
     attributes: dict[str, Any], sync_config: dict[str, str], detail_cfg: Any
-) -> str:
+) -> Any:
     if has_key(attributes, detail_cfg[ATTR_NAME]):
         current_value = attributes[detail_cfg[ATTR_NAME]]
         for i in range(len(detail_cfg[CFG_KEYS])):
@@ -160,8 +143,8 @@ def _get_detail_value(
 
 
 def _bemfa_climate_mode(
-    state: str, attributes: ReadOnlyDict[Mapping[str, Any]]
-) -> int | str:
+    state: str, attributes: Mapping[str, Any]
+) -> int | None:
     preset_mode = str(attributes.get(ATTR_PRESET_MODE, "")).lower()
     if preset_mode in ("sleep", "sleep_mode", "睡眠"):
         return 6
@@ -169,7 +152,7 @@ def _bemfa_climate_mode(
         return 7
     if state in SUPPORTED_HVAC_MODES:
         return SUPPORTED_HVAC_MODES.index(state) + 1
-    return ""
+    return None
 
 
 @SYNC_TYPES.register("climate")
@@ -193,9 +176,6 @@ class Climate(ControllableSync):
         syncs = []
         for state in hass.states.async_all(cls._supported_domain()):
             hvac_modes = state.attributes.get(ATTR_HVAC_MODES, [])
-            # Only treat as air-conditioner (005) when the entity supports COOL.
-            # Heat-only entities (e.g. floor heating / thermostat) fall through
-            # to the Thermostat subclass and be reported as 010.
             if HVACMode.COOL not in hvac_modes:
                 continue
             syncs.append(cls(hass, state.entity_id, state.name))
@@ -232,102 +212,36 @@ class Climate(ControllableSync):
                             ] = selector
         return schema
 
-    def _msg_generators(
-        self,
-    ) -> list[Callable[[str, ReadOnlyDict[Mapping[str, Any]]], str | int]]:
-        return [
-            lambda state, attributes: MSG_OFF if state == HVACMode.OFF else MSG_ON,
-            lambda state, attributes: _bemfa_climate_mode(state, attributes),
-            lambda state, attributes: round(attributes[ATTR_TEMPERATURE])
-            if has_key(attributes, ATTR_TEMPERATURE)
-            else "",
-            lambda state, attributes: _get_detail_value(
-                attributes, self._config, DETAILS_CFG[0]
-            ),
-            lambda state, attributes: _get_detail_value(
-                attributes, self._config, DETAILS_CFG[1]
-            ),
-        ]
+    def _generate_msg_payload(self) -> dict[str, Any]:
+        state = self._hass.states.get(self._entity_id)
+        if state is None or state.state in UNPUBLISHABLE_STATES:
+            return {}
 
-    def _msg_resolvers(
-        self,
-    ) -> list[
-        (
-            int,
-            int,
-            Callable[
-                [list[str | int], ReadOnlyDict[Mapping[str, Any]]],
-                (str, str, dict[str, Any]),
-            ],
-        )
-    ]:
-        return [
-            (
-                0,
-                2,
-                self._resolve_power_or_mode,
-            ),
-            (
-                2,
-                3,
-                lambda msg, attributes: (
-                    DOMAIN,
-                    SERVICE_SET_TEMPERATURE,
-                    {ATTR_TEMPERATURE: msg[0]},
-                ),
-            ),
-            (
-                3,
-                4,
-                self._resolve_fan_mode,
-            ),
-            (
-                4,
-                6,
-                lambda msg, attributes: (
-                    DOMAIN,
-                    SERVICE_SET_SWING_MODE,
-                    {
-                        ATTR_SWING_MODE: self._config[
-                            DETAILS_CFG[1][CFG_KEYS][
-                                DETAILS_CFG[1][CFG_VALUES].index(
-                                    MSG_SEPARATOR.join(map(str, msg))
-                                )
-                            ]
-                        ]
-                    },
-                ),
-            ),
-        ]
+        attributes = state.attributes
+        on = state.state != HVACMode.OFF
+        payload: dict[str, Any] = {"on": on}
 
-    def _resolve_power_or_mode(
-        self, msg: list[str | int], attributes: ReadOnlyDict[Mapping[str, Any]]
-    ) -> tuple[str, str, dict[str, Any]]:
-        if msg[0] == MSG_OFF:
-            return DOMAIN, SERVICE_TURN_OFF, {}
-        if len(msg) == 1:
-            return DOMAIN, SERVICE_TURN_ON, {}
+        if not on:
+            return payload
 
-        mode = int(msg[1])
-        if hvac_mode := _climate_hvac_mode(mode):
-            return DOMAIN, SERVICE_SET_HVAC_MODE, {ATTR_HVAC_MODE: hvac_mode}
-        if preset_mode := _climate_preset_mode(mode, attributes.get(ATTR_PRESET_MODES, [])):
-            return DOMAIN, SERVICE_SET_PRESET_MODE, {"preset_mode": preset_mode}
-        # Unknown mode value — just power on without changing mode to avoid re-triggering
-        # state sync loops caused by an unrecognised mode resetting the AC state.
-        return DOMAIN, SERVICE_TURN_ON, {}
+        mode = _bemfa_climate_mode(state.state, attributes)
+        if mode is not None:
+            payload["mode"] = mode
 
-    def _resolve_fan_mode(
-        self, msg: list[str | int], attributes: ReadOnlyDict[Mapping[str, Any]]
-    ) -> tuple[str, str, dict[str, Any]]:
-        fan_mode = _climate_fan_mode(
-            int(msg[0]),
-            self._config,
-            attributes.get(ATTR_FAN_MODES, []),
-        )
-        if fan_mode is None:
-            return DOMAIN, SERVICE_TURN_ON, {}
-        return DOMAIN, SERVICE_SET_FAN_MODE, {ATTR_FAN_MODE: fan_mode}
+        if has_key(attributes, ATTR_TEMPERATURE):
+            payload["t"] = round(attributes[ATTR_TEMPERATURE])
+
+        fan_value = _get_detail_value(attributes, self._config, DETAILS_CFG[0])
+        if fan_value is not None:
+            payload["fan"] = fan_value
+
+        swing_value = _get_detail_value(attributes, self._config, DETAILS_CFG[1])
+        if isinstance(swing_value, tuple) and len(swing_value) == 2:
+            l2r, u2d = swing_value
+            payload["l2r"] = 360 if l2r else 0
+            payload["u2d"] = 360 if u2d else 0
+
+        return payload
 
 
 @SYNC_TYPES.register("thermostat")
@@ -344,12 +258,6 @@ class Thermostat(Climate):
 
     @classmethod
     def collect_supported_syncs(cls, hass):
-        # Treat a climate entity as a thermostat / floor-heating device (010)
-        # whenever it does NOT support COOL. This covers both:
-        #   * heat-only devices (floor heating, radiator, wall thermostat)
-        #   * entities without any HVAC mode information
-        # Air-conditioners (which must support COOL) are handled by the
-        # Climate parent class and reported as 005.
         return [
             cls(hass, state.entity_id, state.name)
             for state in hass.states.async_all(cls._supported_domain())
