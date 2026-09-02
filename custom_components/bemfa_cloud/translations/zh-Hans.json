@@ -141,6 +141,12 @@
           "name": "名称"
         }
       },
+      "sync_config_button": {
+        "title": "配置按钮",
+        "data": {
+          "name": "名称"
+        }
+      },
       "sync_config_outlet": {
         "title": "配置插座",
         "data": {

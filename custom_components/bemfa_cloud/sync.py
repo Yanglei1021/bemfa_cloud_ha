@@ -289,16 +289,18 @@ class ControllableSync(Sync):
             )
             from homeassistant.const import SERVICE_TURN_OFF, SERVICE_TURN_ON
 
-            if payload.get("on", True) is False:
+            if payload.get("on") is True:
+                self._async_call_service(DOMAIN, SERVICE_TURN_ON, {})
+                if "v" in payload and ATTR_PERCENTAGE_STEP in attributes:
+                    percentage = min(
+                        max(_to_int(payload["v"]), 1) * attributes[ATTR_PERCENTAGE_STEP],
+                        100,
+                    )
+                    self._async_call_service(
+                        DOMAIN, SERVICE_SET_PERCENTAGE, {ATTR_PERCENTAGE: percentage}
+                    )
+            else:
                 self._async_call_service(DOMAIN, SERVICE_TURN_OFF, {})
-                return True
-            if "v" in payload and ATTR_PERCENTAGE_STEP in attributes:
-                percentage = min(max(_to_int(payload["v"]), 1) * attributes[ATTR_PERCENTAGE_STEP], 100)
-                self._async_call_service(
-                    DOMAIN, SERVICE_SET_PERCENTAGE, {ATTR_PERCENTAGE: percentage}
-                )
-                return True
-            self._async_call_service(DOMAIN, SERVICE_TURN_ON, {})
             return True
 
         if suffix == TopicSuffix.COVER:

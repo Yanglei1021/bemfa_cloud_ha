@@ -18,6 +18,14 @@ from .sync import SYNC_TYPES, ControllableSync, UNPUBLISHABLE_STATES
 class Light(ControllableSync):
     """Sync a hass light entity to bemfa light device."""
 
+    @classmethod
+    def collect_supported_syncs(cls, hass):
+        return [
+            cls(hass, state.entity_id, state.name)
+            for state in hass.states.async_all(cls._supported_domain())
+            if not cls._is_switch_only_light(state.attributes)
+        ]
+
     @staticmethod
     def get_config_step_id() -> str:
         return "sync_config_light"
@@ -29,6 +37,13 @@ class Light(ControllableSync):
     @staticmethod
     def _supported_domain() -> str:
         return DOMAIN
+
+    @staticmethod
+    def _is_switch_only_light(attributes: Mapping[str, Any]) -> bool:
+        supported_color_modes = attributes.get(ATTR_SUPPORTED_COLOR_MODES)
+        return supported_color_modes is not None and set(supported_color_modes) == {
+            ColorMode.ONOFF
+        }
 
     def _generate_msg_payload(self) -> dict[str, Any]:
         state = self._hass.states.get(self._entity_id)

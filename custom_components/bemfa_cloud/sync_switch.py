@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 from homeassistant.components.automation import DOMAIN as AUTOMATION_DOMAIN
+from homeassistant.components.button import DOMAIN as BUTTON_DOMAIN
 from homeassistant.components.camera import DOMAIN as CAMERA_DOMAIN
 try:
     from homeassistant.components.camera.const import CameraState
@@ -54,6 +55,8 @@ from homeassistant.const import (
 from homeassistant.core import DOMAIN as HOMEASSISTANT_DOMAIN
 from .const import TopicSuffix
 from .sync import SYNC_TYPES, ControllableSync, UNPUBLISHABLE_STATES
+
+SERVICE_PRESS = "press"
 
 
 @SYNC_TYPES.register("switch")
@@ -214,6 +217,34 @@ class Scene(Switch):
 
     def _is_on(self, state: str, attributes: Mapping[str, Any]) -> bool:
         return False
+
+
+@SYNC_TYPES.register("button")
+class Button(Scene):
+    """Sync a Home Assistant button to a Bemfa switch device."""
+
+    @staticmethod
+    def get_config_step_id() -> str:
+        return "sync_config_button"
+
+    @staticmethod
+    def _supported_domain() -> str:
+        return BUTTON_DOMAIN
+
+    def resolve_msg(self, msg: Any):
+        if isinstance(msg, dict):
+            if msg.get("on", True):
+                self._async_call_service(BUTTON_DOMAIN, SERVICE_PRESS, {})
+            return
+
+        if str(msg).split("#", 1)[0] == MSG_ON:
+            self._async_call_service(BUTTON_DOMAIN, SERVICE_PRESS, {})
+
+    def _service_domain(self) -> str:
+        return BUTTON_DOMAIN
+
+    def _service_names(self) -> tuple[str, str]:
+        return (SERVICE_PRESS, SERVICE_PRESS)
 
 
 @SYNC_TYPES.register("group")

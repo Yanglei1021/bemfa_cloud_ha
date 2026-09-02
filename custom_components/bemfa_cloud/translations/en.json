@@ -141,6 +141,12 @@
           "name": "Name"
         }
       },
+      "sync_config_button": {
+        "title": "Configure button",
+        "data": {
+          "name": "Name"
+        }
+      },
       "sync_config_outlet": {
         "title": "Configure outlet",
         "data": {

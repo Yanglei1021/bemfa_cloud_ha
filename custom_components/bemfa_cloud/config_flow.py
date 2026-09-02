@@ -63,6 +63,7 @@ BATCH_PRIMARY_DOMAINS = {
     "water_heater",
 }
 BATCH_STANDALONE_DOMAINS = {
+    "button",
     "automation",
     "camera",
     "group",
@@ -492,6 +493,9 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
     async def async_step_sync_config_switch(self, user_input=None) -> FlowResult:
         return await self._async_step_sync_config_done(user_input)
 
+    async def async_step_sync_config_button(self, user_input=None) -> FlowResult:
+        return await self._async_step_sync_config_done(user_input)
+
     async def async_step_sync_config_outlet(self, user_input=None) -> FlowResult:
         return await self._async_step_sync_config_done(user_input)
 
@@ -575,6 +579,8 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
 
         if sync.get_config_step_id() == "sync_config_sensor":
             return False
+        if sync.get_config_step_id() == "sync_config_outlet":
+            return True
 
         domain = sync.entity_id.split(".", 1)[0]
         if domain in BATCH_PRIMARY_DOMAINS:
