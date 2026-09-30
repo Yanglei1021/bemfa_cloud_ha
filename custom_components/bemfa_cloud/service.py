@@ -2,15 +2,22 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from homeassistant.const import SERVICE_TURN_OFF, SERVICE_TURN_ON
 from homeassistant.core import CALLBACK_TYPE, Event, HomeAssistant
 from homeassistant.helpers import area_registry, device_registry, entity_registry
 from homeassistant.helpers.start import async_at_started
 
 from .const import EXCLUDED_SOURCE_PLATFORMS, LOGGER, OPTIONS_NAME
-from .http import BemfaCloudHttp, TopicPayload
+from .http import BemfaCloudApiError, BemfaCloudHttp, TopicPayload
 from .sync import SYNC_TYPES, Sync
 from .tcp import BemfaCloudTcp
+
+MAX_TOPIC_LENGTH = 48
+MAX_ROOM_LENGTH = 32
+MAX_GROUP_LENGTH = 32
+RESTORE_RETRY_DELAYS = (1, 2, 4)
 
 
 class BemfaCloudService:
@@ -33,17 +40,35 @@ class BemfaCloudService:
         await self._tcp.async_start()
 
         async def _start(hass: HomeAssistant) -> None:
-            await self._async_restore_syncs()
+            await self._async_restore_syncs_with_retry()
 
-        # Always wait for HA to be fully started before restoring syncs.
-        # The entity registry may not be fully loaded yet if this integration
-        # starts (or reloads) while HA is still starting up, which previously
-        # caused Sync.topic hashes to be computed inconsistently across
-        # restarts (e.g. falling back to entity_id instead of unique_id),
-        # creating duplicate topics on the Bemfa side for the same entity.
+        # The entity registry must be fully loaded before topic hashes are
+        # calculated. Otherwise a restart can derive one topic from entity_id
+        # and another from unique_id for the same HA entity.
         async_at_started(self._hass, _start)
 
         self._start_registry_listeners()
+
+    async def _async_restore_syncs_with_retry(self) -> None:
+        """Restore syncs with bounded retries and no unhandled task exception."""
+
+        for attempt, delay in enumerate((*RESTORE_RETRY_DELAYS, None), start=1):
+            try:
+                await self._async_restore_syncs()
+                return
+            except Exception as err:  # noqa: BLE001
+                if delay is None:
+                    LOGGER.error(
+                        "Bemfa sync restore failed after %s attempts: %s", attempt, err
+                    )
+                    return
+                LOGGER.warning(
+                    "Bemfa sync restore attempt %s failed; retrying in %ss: %s",
+                    attempt,
+                    delay,
+                    err,
+                )
+                await asyncio.sleep(delay)
 
     async def async_stop(self) -> None:
         """Stop service."""
@@ -62,9 +87,11 @@ class BemfaCloudService:
             sync.name = sync.config.get(OPTIONS_NAME, sync.name)
             syncs.append(sync)
 
-        await self._ensure_topics(syncs)
-        await self._tcp.async_add_syncs(syncs)
-        self._syncs_by_entity_id = {sync.entity_id: sync for sync in syncs}
+        ready_syncs = await self._ensure_topics(syncs)
+        await self._tcp.async_add_syncs(ready_syncs)
+        self._syncs_by_entity_id = {
+            sync.entity_id: sync for sync in ready_syncs
+        }
 
     def collect_supported_syncs(self) -> list[Sync]:
         """Collect all supported HA syncs."""
@@ -81,8 +108,6 @@ class BemfaCloudService:
         syncs.extend(self._collect_fallback_switch_syncs(covered_entity_ids))
         return sorted(syncs, key=lambda item: item.entity_id)
 
-    # HA-internal domains that support turn_on/turn_off but are not physical
-    # devices and should never be mirrored to Bemfa as switch entities.
     _FALLBACK_EXCLUDED_DOMAINS: frozenset[str] = frozenset(
         {"automation", "script", "scene", "group"}
     )
@@ -119,27 +144,31 @@ class BemfaCloudService:
 
         sync.name = user_input.get(OPTIONS_NAME, sync.name)
         sync.config = user_input.copy()
-        await self._ensure_topics([sync])
-        await self._tcp.async_add_sync(sync)
-        self._syncs_by_entity_id[sync.entity_id] = sync
+        ready_syncs = await self._ensure_topics([sync])
+        if ready_syncs:
+            await self._tcp.async_add_sync(sync)
+            self._syncs_by_entity_id[sync.entity_id] = sync
 
     async def async_create_syncs(self, syncs: list[Sync]) -> None:
         """Create multiple syncs with default names."""
 
         for sync in syncs:
             sync.config = {OPTIONS_NAME: sync.name}
-        await self._ensure_topics(syncs)
-        await self._tcp.async_add_syncs(syncs)
-        self._syncs_by_entity_id.update({sync.entity_id: sync for sync in syncs})
+        ready_syncs = await self._ensure_topics(syncs)
+        await self._tcp.async_add_syncs(ready_syncs)
+        self._syncs_by_entity_id.update(
+            {sync.entity_id: sync for sync in ready_syncs}
+        )
 
     async def async_modify_sync(self, sync: Sync, user_input: dict[str, str]) -> None:
         """Modify sync configuration and publish the latest state."""
 
         sync.name = user_input.get(OPTIONS_NAME, sync.name)
         sync.config = user_input.copy()
-        await self._ensure_topics([sync])
-        await self._tcp.async_update_sync(sync)
-        self._syncs_by_entity_id[sync.entity_id] = sync
+        ready_syncs = await self._ensure_topics([sync])
+        if ready_syncs:
+            await self._tcp.async_update_sync(sync)
+            self._syncs_by_entity_id[sync.entity_id] = sync
 
     async def async_destroy_sync(self, topic: str) -> None:
         """Remove a local sync."""
@@ -151,13 +180,84 @@ class BemfaCloudService:
         }
         await self._tcp.async_remove_sync(topic)
 
-    async def _ensure_topics(self, syncs: list[Sync]) -> None:
-        await self._http.async_create_topics(
-            [
-                TopicPayload(topic=sync.topic, name=sync.name, room=self._sync_room(sync))
-                for sync in syncs
-            ]
-        )
+    async def _ensure_topics(self, syncs: list[Sync]) -> list[Sync]:
+        payloads = [
+            TopicPayload(topic=sync.topic, name=sync.name, room=self._sync_room(sync))
+            for sync in syncs
+        ]
+        failures: dict[str, str] = {}
+        valid_payloads: list[TopicPayload] = []
+        for payload in payloads:
+            if reason := self._topic_payload_validation_error(payload):
+                failures[payload.topic] = reason
+            else:
+                valid_payloads.append(payload)
+
+        try:
+            batch_failures = await self._http.async_create_topics(valid_payloads)
+        except Exception as err:  # noqa: BLE001
+            LOGGER.warning(
+                "Bemfa batch topic creation failed; retrying topics individually: %s",
+                err,
+            )
+            failures.update(
+                await self._async_retry_topics_individually(valid_payloads)
+            )
+        else:
+            if batch_failures:
+                LOGGER.warning(
+                    "Bemfa batch reported failed topics; confirming them individually: %s",
+                    batch_failures,
+                )
+                failed_topics = set(batch_failures)
+                failures.update(
+                    await self._async_retry_topics_individually(
+                        [
+                            payload
+                            for payload in valid_payloads
+                            if payload.topic in failed_topics
+                        ]
+                    )
+                )
+
+        if failures:
+            LOGGER.warning("Skip Bemfa syncs with confirmed creation failures: %s", failures)
+        return [sync for sync in syncs if sync.topic not in failures]
+
+    @staticmethod
+    def _topic_payload_validation_error(payload: TopicPayload) -> str | None:
+        """Return a local validation error matching the Bemfa API constraints."""
+
+        if not payload.topic:
+            return "topic is required"
+        if len(payload.topic) > MAX_TOPIC_LENGTH:
+            return f"topic length exceeds {MAX_TOPIC_LENGTH}"
+        if not payload.topic.isascii() or not payload.topic.isalnum():
+            return "topic must contain only ASCII letters and numbers"
+        if len(payload.room) > MAX_ROOM_LENGTH:
+            return f"room length exceeds {MAX_ROOM_LENGTH}"
+        if len(payload.group) > MAX_GROUP_LENGTH:
+            return f"group length exceeds {MAX_GROUP_LENGTH}"
+        return None
+
+    async def _async_retry_topics_individually(
+            self, payloads: list[TopicPayload]
+    ) -> dict[str, str]:
+        """Retry a rejected batch without blocking TCP restore for uncertain failures."""
+
+        failures: dict[str, str] = {}
+        for payload in payloads:
+            try:
+                failures.update(await self._http.async_create_topics([payload]))
+            except BemfaCloudApiError as err:
+                failures[payload.topic] = str(err)
+            except Exception as err:  # noqa: BLE001
+                LOGGER.warning(
+                    "Unable to confirm Bemfa topic %s; continue TCP sync: %s",
+                    payload.topic,
+                    err,
+                )
+        return failures
 
     def _start_registry_listeners(self) -> None:
         """Listen for HA name and area changes and mirror them to Bemfa."""
